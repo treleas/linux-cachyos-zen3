@@ -1,0 +1,116 @@
+name: Build linux-cachyos-zen3
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '0 */12 * * *'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:base-devel
+      options: --privileged -v /:/host
+
+    steps:
+      - name: Free up disk space on GitHub Runner host
+        run: |
+          rm -rf /host/usr/share/dotnet /host/usr/local/lib/android /host/opt/ghc /host/opt/hostedtoolcache/CodeQL || true
+          df -h /host
+
+      - name: Setup Arch Linux & Build Deps
+        run: |
+          pacman-key --init
+          pacman-key --populate archlinux
+          pacman -Syu --noconfirm git base-devel bc binutils cpio gettext glibc libelf libgcc openssl pahole perl python rust rust-bindgen rust-src tar xxhash xz zlib zstd jq clang lld llvm github-cli gnupg
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
+      - name: Clone CachyOS PKGBUILDs
+        run: |
+          su - builder -c "git clone --depth=1 https://github.com/CachyOS/linux-cachyos.git /home/builder/linux-cachyos"
+
+      - name: Check version & Compare with existing release
+        id: check
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cd /home/builder/linux-cachyos/linux-cachyos-bore
+          MAJOR=$(grep '^_major=' PKGBUILD | cut -d'=' -f2)
+          MINOR=$(grep '^_minor=' PKGBUILD | cut -d'=' -f2)
+          PKGREL=$(grep '^pkgrel=' PKGBUILD | cut -d'=' -f2)
+          VERSION="${MAJOR}.${MINOR}-${PKGREL}"
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+          ASSETS=$(curl -s -H "Authorization: token $GH_TOKEN" "https://api.github.com/repos/${{ github.repository }}/releases/tags/repo" | jq -r '.assets[].name' 2>/dev/null || echo "")
+          if echo "$ASSETS" | grep -q "linux-cachyos-zen3-${VERSION}-"; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+            echo "Version $VERSION is already built."
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Patch PKGBUILD for znver3
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          cd /home/builder/linux-cachyos/linux-cachyos-bore
+          # set package name to linux-cachyos-zen3 instead of linux-cachyos-bore
+          sed -i 's/^pkgbase=.*/pkgbase="linux-cachyos-zen3"\n_pkgsuffix="cachyos-zen3"/' PKGBUILD
+          
+          # optimizations for Zen 3 and Clang ThinLTO
+          sed -i 's/: "${_processor_opt:=}"/: "${_processor_opt:=generic}"/' PKGBUILD
+          sed -i 's/: "${_use_llvm_lto:=none}"/: "${_use_llvm_lto:=thin}"/' PKGBUILD
+          sed -i '/BUILD_FLAGS=(/a \        KCFLAGS="-march=znver3"\n        KCPPFLAGS="-march=znver3"' PKGBUILD
+
+          echo 'MAKEFLAGS="-j$(nproc)"' >> /etc/makepkg.conf
+          chown -R builder:builder /home/builder/linux-cachyos
+
+      - name: Build Kernel
+        if: steps.check.outputs.exists == 'false'
+        run: |
+          su - builder -c "cd /home/builder/linux-cachyos/linux-cachyos-bore && KCFLAGS='-march=znver3' KCPPFLAGS='-march=znver3' makepkg -s --noconfirm --skipinteg"
+
+      - name: Sign Packages & Generate Pacman Repository DB
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GPG_PRIVATE_KEY: ${{ secrets.GPG_PRIVATE_KEY }}
+        run: |
+          mkdir -p /home/builder/repo
+          cp /home/builder/linux-cachyos/linux-cachyos-bore/*.pkg.tar.zst /home/builder/repo/
+          
+          # make public key
+          echo "$GPG_PRIVATE_KEY" | gpg --batch --import
+          gpg --armor --export > /home/builder/repo/public.gpg
+          
+          cd /home/builder/repo
+          # signing packages (.pkg.tar.zst.sig)
+          for pkg in *.pkg.tar.zst; do
+            gpg --batch --yes --pinentry-mode loopback --detach-sign "$pkg"
+          done
+          
+          # gen sign base
+          repo-add -s linux-cachyos-znver3.db.tar.gz *.pkg.tar.zst
+          
+          rm -f linux-cachyos-znver3.db linux-cachyos-znver3.db.sig linux-cachyos-znver3.files linux-cachyos-znver3.files.sig
+          cp linux-cachyos-znver3.db.tar.gz linux-cachyos-znver3.db
+          cp linux-cachyos-znver3.db.tar.gz.sig linux-cachyos-znver3.db.sig
+          cp linux-cachyos-znver3.files.tar.gz linux-cachyos-znver3.files
+          cp linux-cachyos-znver3.files.tar.gz.sig linux-cachyos-znver3.files.sig
+
+      - name: Clean old assets in release
+        if: steps.check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release view repo --repo ${{ github.repository }} --json assets -q '.assets[].name' 2>/dev/null | xargs -r -n1 gh release delete-asset repo --repo ${{ github.repository }} -y || true
+
+      - name: Publish to GitHub Release
+        if: steps.check.outputs.exists == 'false'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: repo
+          name: "CachyOS znver3 Repository"
+          body: "Latest build: ${{ steps.check.outputs.version }}"
+          files: /home/builder/repo/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
